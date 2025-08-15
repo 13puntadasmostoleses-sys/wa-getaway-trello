@@ -1,96 +1,140 @@
-const express = require('express');
-const QRCode = require('qrcode');
-const pino = require('pino');
+const express = require("express");
+const QRCode = require("qrcode");
+const pino = require("pino");
+const fs = require("fs");
+const path = require("path");
+
 const {
-  default: makeWASocket,
+  makeWASocket,
+  DisconnectReason,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
-  DisconnectReason,
-} = require('@whiskeysockets/baileys');
+} = require("@whiskeysockets/baileys");
 
-const app = express();
+// === ENV ===
 const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.API_KEY || "changeme";
+const SESSION_NAME = process.env.SESSION_NAME || "trello-session";
+const NODE_ENV = process.env.NODE_ENV || "production";
 
-let lastQr = null;
+// === Paths (relativos, escritura segura en Railway) ===
+const authDir = path.join(process.cwd(), "auth", SESSION_NAME);
+fs.mkdirSync(authDir, { recursive: true });
+
+// === App ===
+const app = express();
+app.use(express.json());
+
+// Seguridad simple por header x-api-key (se permiten GET /, /qr, /status)
+app.use((req, res, next) => {
+  if (req.method === "GET" && (req.path === "/" || req.path === "/qr" || req.path === "/status")) {
+    return next();
+  }
+  if (req.path.startsWith("/qr") || req.path === "/") return next();
+  const key = req.headers["x-api-key"];
+  if (key !== API_KEY) return res.status(401).json({ error: "unauthorized" });
+  next();
+});
+
 let sock = null;
+let lastQr = null;
+let connected = false;
 
-async function start() {
+// === Helpers de log ===
+const log = (...args) => console.log("[WA]", ...args);
+const logger = pino({ level: "silent" });
+
+// === Start WhatsApp ===
+async function startSock() {
   try {
-    const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
+    log("Iniciando Baileys…");
     const { version } = await fetchLatestBaileysVersion();
+    log("Versión Baileys/WA:", version);
+
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
     sock = makeWASocket({
       version,
+      logger,
+      printQRInTerminal: true, // ASCII en logs
       auth: state,
-      logger: pino({ level: 'silent' }),
-      printQRInTerminal: false, // lo manejo yo
-      browser: ['Railway QR Test', 'Chrome', '10'],
+      browser: ["RailwayBot", "Chrome", "18"],
+      connectTimeoutMs: 60_000,
     });
 
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on("creds.update", saveCreds);
 
-    sock.ev.on('connection.update', async (u) => {
-      const { connection, lastDisconnect, qr } = u;
-
+    sock.ev.on("connection.update", (update) => {
+      const { qr, connection, lastDisconnect } = update;
       if (qr) {
         lastQr = qr;
-        // QR en ASCII en logs
-        try {
-          const ascii = await QRCode.toString(qr, { type: 'terminal', small: true });
-          console.log('\n\n=== ESCANEA ESTE QR EN WhatsApp > Dispositivos vinculados ===\n');
-          console.log(ascii);
-          console.log('\nTambién disponible como imagen en /qr\n');
-        } catch (e) {
-          console.error('Error generando QR ASCII:', e);
-        }
+        connected = false;
+        log("QR recibido. Abre /qr para verlo.");
       }
-
-      if (connection === 'open') {
-        console.log('✅ Conectado a WhatsApp (sesión creada).');
-      }
-
-      if (connection === 'close') {
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        console.log('Conexión cerrada. statusCode=', statusCode, 'reconectar:', shouldReconnect);
+      if (connection === "open") {
+        connected = true;
+        lastQr = null;
+        log("Conectado a WhatsApp ✅");
+      } else if (connection === "close") {
+        connected = false;
+        const shouldReconnect =
+          (lastDisconnect?.error?.output?.statusCode || lastDisconnect?.error?.code) !==
+          DisconnectReason.loggedOut;
+        log("Conexión cerrada. shouldReconnect:", shouldReconnect);
         if (shouldReconnect) {
-          setTimeout(start, 3000);
+          setTimeout(startSock, 3_000);
+        } else {
+          log("Sesión cerrada (loggedOut). Borra la carpeta auth si quieres re-vincular.");
         }
       }
     });
-  } catch (e) {
-    console.error('Fallo en start():', e);
-    setTimeout(start, 5000);
+
+    // (Opcional) Ver algo cuando llega un mensaje
+    sock.ev.on("messages.upsert", (m) => {
+      try {
+        const msg = m.messages?.[0];
+        if (!msg) return;
+        const from = msg.key.remoteJid;
+        const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text;
+        if (text) log("Mensaje entrante de", from, "→", text);
+      } catch {}
+    });
+  } catch (err) {
+    log("Error en startSock:", err?.message || err);
+    setTimeout(startSock, 5_000);
   }
 }
 
-// Rutas HTTP
-app.get('/', (_req, res) => res.send('OK: /qr mostrará el código cuando esté listo.'));
+// === Rutas HTTP ===
+app.get("/", (_, res) => res.send("OK: servicio vivo"));
 
-app.get('/qr', async (_req, res) => {
+app.get("/status", (_, res) => {
+  res.json({
+    connected,
+    hasQR: !!lastQr,
+    session: SESSION_NAME,
+    env: NODE_ENV,
+  });
+});
+
+app.get("/qr", async (req, res) => {
   try {
     if (!lastQr) {
-      res.status(202).send('QR aún no generado. Abre los Deploy Logs y espera ~10-20s.');
-      return;
+      return res
+        .status(503)
+        .send("Aún no hay QR disponible. Espera 3–10s y refresca esta página.");
     }
-    const dataUrl = await QRCode.toDataURL(lastQr);
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.end(`
-      <html>
-        <body style="font-family:system-ui">
-          <h2>Escanea este QR en WhatsApp → Dispositivos vinculados</h2>
-          <img src="${dataUrl}" alt="QR" />
-          <p>Si expira, refresca esta página.</p>
-        </body>
-      </html>
-    `);
+    // Devuelve PNG simple
+    const png = await QRCode.toBuffer(lastQr, { width: 300, margin: 1 });
+    res.setHeader("Content-Type", "image/png");
+    res.send(png);
   } catch (e) {
-    console.error('Error /qr:', e);
-    res.status(500).send('Error generando QR.');
+    res.status(500).send("Error generando QR");
   }
 });
 
-app.listen(PORT, () => console.log('HTTP up on :' + PORT));
-
-// Lanzar Baileys
-start();
+// === Arranque ===
+app.listen(PORT, () => {
+  console.log("HTTP up on :", PORT);
+  startSock();
+});
