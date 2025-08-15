@@ -4,7 +4,7 @@ import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
   fetchLatestBaileysVersion
-} from "@adiwajshing/baileys";
+} from '@whiskeysockets/baileys';
 import pino from "pino";
 
 const PORT = process.env.PORT || 3000;
