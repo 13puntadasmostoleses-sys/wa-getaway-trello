@@ -1,88 +1,96 @@
-import express from "express";
-import qrcode from "qrcode";
-import {
-  makeWASocket,
-  DisconnectReason,
+const express = require('express');
+const QRCode = require('qrcode');
+const pino = require('pino');
+const {
+  default: makeWASocket,
   useMultiFileAuthState,
-  fetchLatestBaileysVersion
-} from "@whiskeysockets/baileys";
-import pino from "pino";
-
-const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY || "changeme";
-const SESSION_NAME = process.env.SESSION_NAME || "trello-session";
+  fetchLatestBaileysVersion,
+  DisconnectReason,
+} = require('@whiskeysockets/baileys');
 
 const app = express();
-app.use(express.json());
+const PORT = process.env.PORT || 3000;
 
-// Seguridad simple: x-api-key (QR y raíz libres)
-app.use((req, res, next) => {
-  if (req.path.startsWith("/qr") || req.path === "/") return next();
-  const key = req.headers["x-api-key"];
-  if (!key || key !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
-  next();
-});
+let lastQr = null;
+let sock = null;
 
-// Estado global del socket
-let sock;
-let qrData = "";
-
-const startSock = async () => {
-  const { state, saveCreds } = await useMultiFileAuthState(`./${SESSION_NAME}`);
-  const { version } = await fetchLatestBaileysVersion();
-  
-  sock = makeWASocket({
-    version,
-    printQRInTerminal: false,
-    auth: state,
-    logger: pino({ level: "silent" }),
-    generateHighQualityLinkPreview: true
-  });
-
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    if (qr) {
-      qrData = await qrcode.toDataURL(qr);
-    }
-    if (connection === "close") {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      if (shouldReconnect) startSock();
-    }
-  });
-
-  sock.ev.on("creds.update", saveCreds);
-};
-
-startSock();
-
-// Endpoint para obtener el QR en base64
-app.get("/qr", async (req, res) => {
-  if (qrData) {
-    res.send(`<img src="${qrData}" style="height: 300px" />`);
-  } else {
-    res.send("QR no generado todavía. Espera unos segundos...");
-  }
-});
-
-// Endpoint de prueba
-app.get("/", (req, res) => {
-  res.send("✅ Bot de WhatsApp activo");
-});
-
-// Endpoint para enviar mensaje (usa API_KEY como header)
-app.post("/send", async (req, res) => {
-  const { number, message } = req.body;
-  if (!number || !message) return res.status(400).json({ error: "Falta número o mensaje" });
-
+async function start() {
   try {
-    const id = number.includes("@s.whatsapp.net") ? number : `${number}@s.whatsapp.net`;
-    await sock.sendMessage(id, { text: message });
-    res.json({ success: true });
+    const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
+    const { version } = await fetchLatestBaileysVersion();
+
+    sock = makeWASocket({
+      version,
+      auth: state,
+      logger: pino({ level: 'silent' }),
+      printQRInTerminal: false, // lo manejo yo
+      browser: ['Railway QR Test', 'Chrome', '10'],
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', async (u) => {
+      const { connection, lastDisconnect, qr } = u;
+
+      if (qr) {
+        lastQr = qr;
+        // QR en ASCII en logs
+        try {
+          const ascii = await QRCode.toString(qr, { type: 'terminal', small: true });
+          console.log('\n\n=== ESCANEA ESTE QR EN WhatsApp > Dispositivos vinculados ===\n');
+          console.log(ascii);
+          console.log('\nTambién disponible como imagen en /qr\n');
+        } catch (e) {
+          console.error('Error generando QR ASCII:', e);
+        }
+      }
+
+      if (connection === 'open') {
+        console.log('✅ Conectado a WhatsApp (sesión creada).');
+      }
+
+      if (connection === 'close') {
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        console.log('Conexión cerrada. statusCode=', statusCode, 'reconectar:', shouldReconnect);
+        if (shouldReconnect) {
+          setTimeout(start, 3000);
+        }
+      }
+    });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error('Fallo en start():', e);
+    setTimeout(start, 5000);
+  }
+}
+
+// Rutas HTTP
+app.get('/', (_req, res) => res.send('OK: /qr mostrará el código cuando esté listo.'));
+
+app.get('/qr', async (_req, res) => {
+  try {
+    if (!lastQr) {
+      res.status(202).send('QR aún no generado. Abre los Deploy Logs y espera ~10-20s.');
+      return;
+    }
+    const dataUrl = await QRCode.toDataURL(lastQr);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.end(`
+      <html>
+        <body style="font-family:system-ui">
+          <h2>Escanea este QR en WhatsApp → Dispositivos vinculados</h2>
+          <img src="${dataUrl}" alt="QR" />
+          <p>Si expira, refresca esta página.</p>
+        </body>
+      </html>
+    `);
+  } catch (e) {
+    console.error('Error /qr:', e);
+    res.status(500).send('Error generando QR.');
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`HTTP up on :${PORT}`);
-});
+app.listen(PORT, () => console.log('HTTP up on :' + PORT));
+
+// Lanzar Baileys
+start();
